@@ -1,8 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 
 // Initialize Supabase client with error checking
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
   console.error('Missing Supabase environment variables');
@@ -30,21 +30,19 @@ export default async function handler(req, res) {
     // Parse Slack command data (URL-encoded form data)
     const slackData = req.body;
     
-    // Verify Slack request (optional but recommended)
-    // const slackSignature = req.headers['x-slack-signature'];
-    // const slackTimestamp = req.headers['x-slack-request-timestamp'];
-    // Add verification logic here if needed
-
     const { text, user_id, user_name, channel_id, response_url } = slackData;
 
-    // Parse command text (expecting format: "book 2024-01-20" or "cancel 2024-01-20")
-    const [action, date] = text.trim().split(' ');
+    // Parse command text (expecting format: "book 2024-01-20 location" or "cancel 2024-01-20")
+    const parts = text.trim().split(' ');
+    const action = parts[0];
+    const date = parts[1];
+    const location = parts.slice(2).join(' '); // Join remaining parts as location
 
     // Validate input
     if (!action || !date) {
       return res.status(200).json({
         response_type: 'ephemeral',
-        text: 'Please use format: `/bookdesk book YYYY-MM-DD` or `/bookdesk cancel YYYY-MM-DD`'
+        text: 'Please use format: `/bookdesk book YYYY-MM-DD location` or `/bookdesk cancel YYYY-MM-DD`'
       });
     }
 
@@ -60,13 +58,13 @@ export default async function handler(req, res) {
     // Handle different actions
     switch (action.toLowerCase()) {
       case 'book':
-        return await handleBooking(res, { user_id, user_name, date, channel_id });
+        return await handleBooking(res, { user_id, user_name, date, location, channel_id });
       
       case 'cancel':
         return await handleCancellation(res, { user_id, date });
       
       case 'list':
-        return await handleList(res, { date });
+        return await handleList(res, { date, location });
       
       default:
         return res.status(200).json({
@@ -84,35 +82,41 @@ export default async function handler(req, res) {
   }
 }
 
-async function handleBooking(res, { user_id, user_name, date, channel_id }) {
+async function handleBooking(res, { user_id, user_name, date, location, channel_id }) {
   try {
     // Check if user already has a booking for this date
     const { data: existingBooking, error: checkError } = await supabase
       .from('bookings')
       .select('*')
-      .eq('user_id', user_id)
+      .eq('employee_name', user_name)
       .eq('date', date)
       .single();
 
     if (existingBooking) {
       return res.status(200).json({
         response_type: 'ephemeral',
-        text: `You already have a desk booked for ${date}`
+        text: `You already have a desk booked for ${date} at ${existingBooking.location}`
       });
     }
 
-    // Check desk availability (assuming max 10 desks)
-    const { count, error: countError } = await supabase
+    // Get available desks for the location and date
+    const { data: bookings, error: countError } = await supabase
       .from('bookings')
-      .select('*', { count: 'exact', head: true })
-      .eq('date', date);
+      .select('desk_area')
+      .eq('date', date)
+      .eq('location', location || 'Newcastle');
 
     if (countError) throw countError;
 
-    if (count >= 10) {
+    // Find next available desk area (you might want to customize this logic)
+    const bookedDesks = bookings.map(b => b.desk_area);
+    const availableDesks = ['NCL - Monument', 'NCL - St James', 'NCL - Other'];
+    const availableDesk = availableDesks.find(desk => !bookedDesks.includes(desk));
+
+    if (!availableDesk) {
       return res.status(200).json({
         response_type: 'ephemeral',
-        text: `Sorry, all desks are booked for ${date}`
+        text: `Sorry, all desks are booked for ${date} at ${location || 'Newcastle'}`
       });
     }
 
@@ -120,11 +124,11 @@ async function handleBooking(res, { user_id, user_name, date, channel_id }) {
     const { data: newBooking, error: insertError } = await supabase
       .from('bookings')
       .insert({
-        user_id,
-        user_name,
+        employee_name: user_name,
         date,
-        channel_id,
-        desk_number: count + 1, // Simple desk assignment
+        location: location || 'Newcastle',
+        desk_area: availableDesk,
+        parking_space: false, // Default to no parking
         created_at: new Date().toISOString()
       })
       .select()
@@ -134,7 +138,7 @@ async function handleBooking(res, { user_id, user_name, date, channel_id }) {
 
     return res.status(200).json({
       response_type: 'in_channel',
-      text: `✅ Desk ${newBooking.desk_number} booked for ${user_name} on ${date}`
+      text: `✅ Desk booked for ${user_name} on ${date}\n📍 Location: ${newBooking.location}\n🪑 Desk: ${newBooking.desk_area}`
     });
 
   } catch (error) {
@@ -148,10 +152,11 @@ async function handleBooking(res, { user_id, user_name, date, channel_id }) {
 
 async function handleCancellation(res, { user_id, date }) {
   try {
+    // Note: Using user_id as employee_name for now - you might want to map these
     const { data: booking, error: deleteError } = await supabase
       .from('bookings')
       .delete()
-      .eq('user_id', user_id)
+      .eq('employee_name', user_id)
       .eq('date', date)
       .select()
       .single();
@@ -165,7 +170,7 @@ async function handleCancellation(res, { user_id, date }) {
 
     return res.status(200).json({
       response_type: 'in_channel',
-      text: `❌ Booking cancelled for ${date}`
+      text: `❌ Booking cancelled for ${date} at ${booking.location}`
     });
 
   } catch (error) {
@@ -177,30 +182,36 @@ async function handleCancellation(res, { user_id, date }) {
   }
 }
 
-async function handleList(res, { date }) {
+async function handleList(res, { date, location }) {
   try {
-    const { data: bookings, error } = await supabase
+    let query = supabase
       .from('bookings')
-      .select('desk_number, user_name')
-      .eq('date', date)
-      .order('desk_number');
+      .select('desk_area, employee_name, parking_space')
+      .eq('date', date);
+
+    // Add location filter if provided
+    if (location) {
+      query = query.eq('location', location);
+    }
+
+    const { data: bookings, error } = await query.order('desk_area');
 
     if (error) throw error;
 
     if (!bookings || bookings.length === 0) {
       return res.status(200).json({
         response_type: 'ephemeral',
-        text: `No bookings for ${date}`
+        text: `No bookings for ${date}${location ? ' at ' + location : ''}`
       });
     }
 
     const bookingList = bookings
-      .map(b => `• Desk ${b.desk_number}: ${b.user_name}`)
+      .map(b => `• ${b.desk_area}: ${b.employee_name}${b.parking_space ? ' 🚗' : ''}`)
       .join('\n');
 
     return res.status(200).json({
       response_type: 'ephemeral',
-      text: `📅 Bookings for ${date}:\n${bookingList}\n\n${10 - bookings.length} desks available`
+      text: `📅 Bookings for ${date}${location ? ' at ' + location : ''}:\n${bookingList}`
     });
 
   } catch (error) {
