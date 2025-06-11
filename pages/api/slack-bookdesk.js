@@ -456,6 +456,8 @@ async function handleBookingSubmission(payload, res) {
   const wantsParking = values.parking_input?.parking_select?.selected_options?.length > 0;
   const userName = payload.user.name;
 
+  console.log('Booking submission:', { date, location, wantsParking, userName });
+
   try {
     // Check if user already has a booking for this date
     const { data: existing } = await supabase
@@ -529,7 +531,7 @@ async function handleBookingSubmission(payload, res) {
     const deskNumber = deskCount + 1;
     const deskArea = `${location} - Desk ${deskNumber}`;
 
-    await supabase
+    const { data: newBooking, error: insertError } = await supabase
       .from('bookings')
       .insert({
         employee_name: userName,
@@ -538,7 +540,16 @@ async function handleBookingSubmission(payload, res) {
         desk_area: deskArea,
         parking_space: wantsParking && officeConfig.parking,
         created_at: new Date().toISOString()
-      });
+      })
+      .select()
+      .single();
+
+    console.log('Insert result:', { newBooking, insertError });
+
+    if (insertError) {
+      console.error('Failed to insert booking:', insertError);
+      throw insertError;
+    }
 
     // Send success message to channel
     await fetch(payload.response_urls[0].response_url, {
