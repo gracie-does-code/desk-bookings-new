@@ -9,6 +9,16 @@ const supabase = supabaseUrl && supabaseKey
   ? createClient(supabaseUrl, supabaseKey)
   : null;
 
+// Office configurations
+const OFFICE_CONFIG = {
+  'NCL Monument': { capacity: 40, parking: true },
+  'NCL St James': { capacity: 40, parking: true },
+  'Dallas': { capacity: 10, parking: false }
+};
+
+// Shared parking capacity for all Newcastle offices
+const NEWCASTLE_PARKING_CAPACITY = 6;
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -140,13 +150,13 @@ async function handleBlockAction(payload, res) {
   
   switch (action.action_id) {
     case 'action_book':
-      modal = createBookingModal();
+      modal = await createBookingModal();
       break;
     case 'action_list':
       modal = createListModal();
       break;
     case 'action_cancel':
-      modal = createCancelModal(payload.user.name);
+      modal = await createCancelModal(payload.user.name);
       break;
     default:
       return res.status(200).send();
@@ -188,10 +198,27 @@ async function handleViewSubmission(payload, res) {
   }
 }
 
-function createBookingModal() {
+async function createBookingModal() {
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
+  const dateStr = tomorrow.toISOString().split('T')[0];
+
+  // Get current bookings for tomorrow to show availability
+  const availability = await getAvailabilityForDate(dateStr);
   
+  // Create location options with availability info
+  const locationOptions = Object.entries(OFFICE_CONFIG).map(([office, config]) => {
+    const booked = availability[office] || 0;
+    const available = config.capacity - booked;
+    return {
+      text: { 
+        type: 'plain_text', 
+        text: `${office} (${available}/${config.capacity} desks available)` 
+      },
+      value: office
+    };
+  });
+
   return {
     type: 'modal',
     callback_id: 'booking_submit',
@@ -214,7 +241,7 @@ function createBookingModal() {
         element: {
           type: 'datepicker',
           action_id: 'date_select',
-          initial_date: tomorrow.toISOString().split('T')[0],
+          initial_date: dateStr,
           placeholder: {
             type: 'plain_text',
             text: 'Select a date'
@@ -235,20 +262,14 @@ function createBookingModal() {
             type: 'plain_text',
             text: 'Select office'
           },
-          options: [
-            {
-              text: { type: 'plain_text', text: 'Newcastle' },
-              value: 'Newcastle'
-            },
-            {
-              text: { type: 'plain_text', text: 'London' },
-              value: 'London'
-            },
-            {
-              text: { type: 'plain_text', text: 'Manchester' },
-              value: 'Manchester'
-            }
-          ]
+          options: locationOptions
+        }
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '_Parking is only available at Newcastle offices (6 spaces shared between NCL Monument & NCL St James)_'
         }
       },
       {
@@ -256,14 +277,14 @@ function createBookingModal() {
         block_id: 'parking_input',
         label: {
           type: 'plain_text',
-          text: 'Need Parking?'
+          text: 'Parking Space'
         },
         element: {
           type: 'checkboxes',
           action_id: 'parking_select',
           options: [
             {
-              text: { type: 'plain_text', text: 'Reserve parking space' },
+              text: { type: 'plain_text', text: 'Reserve parking space (Newcastle only)' },
               value: 'parking'
             }
           ]
@@ -326,16 +347,16 @@ function createListModal() {
               value: 'all'
             },
             {
-              text: { type: 'plain_text', text: 'Newcastle' },
-              value: 'Newcastle'
+              text: { type: 'plain_text', text: 'NCL Monument' },
+              value: 'NCL Monument'
             },
             {
-              text: { type: 'plain_text', text: 'London' },
-              value: 'London'
+              text: { type: 'plain_text', text: 'NCL St James' },
+              value: 'NCL St James'
             },
             {
-              text: { type: 'plain_text', text: 'Manchester' },
-              value: 'Manchester'
+              text: { type: 'plain_text', text: 'Dallas' },
+              value: 'Dallas'
             }
           ]
         },
@@ -349,7 +370,7 @@ async function createCancelModal(userName) {
   // Get user's upcoming bookings
   const { data: bookings, error } = await supabase
     .from('bookings')
-    .select('id, date, location, desk_area')
+    .select('id, date, location, desk_area, parking_space')
     .eq('employee_name', userName)
     .gte('date', new Date().toISOString().split('T')[0])
     .order('date');
@@ -376,7 +397,7 @@ async function createCancelModal(userName) {
   const options = bookings.map(booking => ({
     text: {
       type: 'plain_text',
-      text: `${booking.date} - ${booking.location} - ${booking.desk_area}`
+      text: `${booking.date} - ${booking.location}${booking.parking_space ? ' (with parking)' : ''}`
     },
     value: booking.id.toString()
   }));
@@ -414,11 +435,25 @@ async function createCancelModal(userName) {
   };
 }
 
+async function getAvailabilityForDate(date) {
+  const { data: bookings } = await supabase
+    .from('bookings')
+    .select('location')
+    .eq('date', date);
+
+  const counts = {};
+  bookings?.forEach(booking => {
+    counts[booking.location] = (counts[booking.location] || 0) + 1;
+  });
+  
+  return counts;
+}
+
 async function handleBookingSubmission(payload, res) {
   const values = payload.view.state.values;
   const date = values.date_input.date_select.selected_date;
   const location = values.location_input.location_select.selected_option.value;
-  const parking = values.parking_input?.parking_select?.selected_options?.length > 0;
+  const wantsParking = values.parking_input?.parking_select?.selected_options?.length > 0;
   const userName = payload.user.name;
 
   try {
@@ -434,54 +469,119 @@ async function handleBookingSubmission(payload, res) {
       return res.status(200).json({
         response_action: 'errors',
         errors: {
-          date_input: `You already have a booking for ${date}`
+          date_input: `You already have a booking for ${date} at ${existing.location}`
         }
       });
     }
 
-    // Find available desk
-    const { data: bookings } = await supabase
-      .from('bookings')
-      .select('desk_area')
-      .eq('date', date)
-      .eq('location', location);
-
-    const bookedDesks = bookings?.map(b => b.desk_area) || [];
-    const availableDesks = ['NCL - Monument', 'NCL - St James', 'NCL - Other'];
-    const availableDesk = availableDesks.find(desk => !bookedDesks.includes(desk));
-
-    if (!availableDesk) {
+    // Check if parking was requested for non-Newcastle office
+    if (wantsParking && location === 'Dallas') {
       return res.status(200).json({
         response_action: 'errors',
         errors: {
-          location_input: `No desks available for ${date} at ${location}`
+          parking_input: 'Parking is only available at Newcastle offices'
         }
       });
     }
 
-    // Create booking
+    // Get current bookings for capacity check
+    const { data: bookings } = await supabase
+      .from('bookings')
+      .select('location, parking_space')
+      .eq('date', date)
+      .eq('location', location);
+
+    const deskCount = bookings?.length || 0;
+    const officeConfig = OFFICE_CONFIG[location];
+
+    // Check desk capacity
+    if (deskCount >= officeConfig.capacity) {
+      return res.status(200).json({
+        response_action: 'errors',
+        errors: {
+          location_input: `Sorry, ${location} is fully booked for ${date} (${officeConfig.capacity}/${officeConfig.capacity} desks taken)`
+        }
+      });
+    }
+
+    // Check parking capacity if requested
+    if (wantsParking && officeConfig.parking) {
+      // Get all Newcastle parking bookings for this date
+      const { data: newcastleBookings } = await supabase
+        .from('bookings')
+        .select('parking_space')
+        .eq('date', date)
+        .in('location', ['NCL Monument', 'NCL St James'])
+        .eq('parking_space', true);
+      
+      const parkingCount = newcastleBookings?.length || 0;
+      if (parkingCount >= NEWCASTLE_PARKING_CAPACITY) {
+        return res.status(200).json({
+          response_action: 'errors',
+          errors: {
+            parking_input: `Sorry, all Newcastle parking spaces are taken for ${date} (${NEWCASTLE_PARKING_CAPACITY}/${NEWCASTLE_PARKING_CAPACITY} spaces taken)`
+          }
+        });
+      }
+    }
+
+    // Create booking with sequential desk number
+    const deskNumber = deskCount + 1;
+    const deskArea = `${location} - Desk ${deskNumber}`;
+
     await supabase
       .from('bookings')
       .insert({
         employee_name: userName,
         date,
         location,
-        desk_area: availableDesk,
-        parking_space: parking,
+        desk_area: deskArea,
+        parking_space: wantsParking && officeConfig.parking,
         created_at: new Date().toISOString()
       });
 
-    // Send success message
+    // Send success message to channel
     await fetch(payload.response_urls[0].response_url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         response_type: 'in_channel',
-        text: `✅ Desk booked for ${userName} on ${date}\n📍 Location: ${location}\n🪑 Desk: ${availableDesk}${parking ? '\n🚗 Parking reserved' : ''}`
+        text: `✅ Desk booked for ${userName} on ${date}\n📍 Location: ${location}\n🪑 Desk: #${deskNumber}${wantsParking ? '\n🚗 Parking space reserved' : ''}`
       })
     });
 
-    return res.status(200).send();
+    // Show success modal
+    const successModal = {
+      type: 'modal',
+      title: {
+        type: 'plain_text',
+        text: '✅ Booking Confirmed!'
+      },
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Your desk has been successfully booked!*\n\n📅 Date: *${date}*\n📍 Location: *${location}*\n🪑 Desk: *#${deskNumber}*${wantsParking ? '\n🚗 Parking: *Reserved*' : ''}\n\n_A confirmation has been posted in the channel._`
+          }
+        },
+        {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              text: 'You can cancel this booking anytime using `/bookdesk`'
+            }
+          ]
+        }
+      ]
+    };
+
+    // Update the view to show success
+    return res.status(200).json({
+      response_action: 'update',
+      view: successModal
+    });
 
   } catch (error) {
     console.error('Booking error:', error);
@@ -509,12 +609,14 @@ async function handleListSubmission(payload, res) {
       query = query.eq('location', location);
     }
 
-    const { data: bookings } = await query.order('location').order('desk_area');
+    const { data: bookings } = await query.order('location').order('created_at');
 
-    let message;
+    let message = `📅 *Bookings for ${date}*\n\n`;
+
     if (!bookings || bookings.length === 0) {
       message = `No bookings found for ${date}`;
     } else {
+      // Group by location and show capacity
       const bookingsByLocation = {};
       bookings.forEach(b => {
         if (!bookingsByLocation[b.location]) {
@@ -523,11 +625,24 @@ async function handleListSubmission(payload, res) {
         bookingsByLocation[b.location].push(b);
       });
 
-      message = `📅 *Bookings for ${date}*\n\n`;
       for (const [loc, books] of Object.entries(bookingsByLocation)) {
-        message += `*${loc}*\n`;
-        books.forEach(b => {
-          message += `• ${b.desk_area}: ${b.employee_name}${b.parking_space ? ' 🚗' : ''}\n`;
+        const config = OFFICE_CONFIG[loc];
+        const parkingCount = books.filter(b => b.parking_space).length;
+        
+        message += `*${loc}* (${books.length}/${config.capacity} desks`;
+        
+        // Show combined Newcastle parking info
+        if (loc === 'NCL Monument' || loc === 'NCL St James') {
+          // Get total Newcastle parking count
+          const allNewcastleParking = bookings
+            .filter(b => (b.location === 'NCL Monument' || b.location === 'NCL St James') && b.parking_space)
+            .length;
+          message += `, ${allNewcastleParking}/${NEWCASTLE_PARKING_CAPACITY} total NCL parking`;
+        }
+        message += `)\n`;
+        
+        books.forEach((b, index) => {
+          message += `${index + 1}. ${b.employee_name}${b.parking_space ? ' 🚗' : ''}\n`;
         });
         message += '\n';
       }
@@ -574,8 +689,31 @@ async function handleCancelSubmission(payload, res) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           response_type: 'in_channel',
-          text: `❌ Booking cancelled for ${booking.date} at ${booking.location}`
+          text: `❌ ${booking.employee_name} cancelled their booking for ${booking.date} at ${booking.location}${booking.parking_space ? ' (parking space released)' : ''}`
         })
+      });
+
+      // Show success modal for cancellation
+      const successModal = {
+        type: 'modal',
+        title: {
+          type: 'plain_text',
+          text: '✅ Booking Cancelled'
+        },
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `*Your booking has been cancelled successfully!*\n\n📅 Date: *${booking.date}*\n📍 Location: *${booking.location}*${booking.parking_space ? '\n🚗 Parking space has been released' : ''}\n\n_A cancellation notice has been posted in the channel._`
+            }
+          }
+        ]
+      };
+
+      return res.status(200).json({
+        response_action: 'update',
+        view: successModal
       });
     }
 
