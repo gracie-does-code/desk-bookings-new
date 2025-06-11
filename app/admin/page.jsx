@@ -4,7 +4,7 @@ import Admin from '../components/Admin.jsx';
 export default function AdminPage() {
   return (
     <AdminAuth>
-      <AdminDashboard />
+      <Admin />
     </AdminAuth>
   );
 }
