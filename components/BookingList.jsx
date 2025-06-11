@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from 'react'
-import { supabase } from '../../../lib/supabase.js'
+import { supabase } from '@/lib/supabase';
 
 export default function BookingList() {
   const [weeklyBookings, setWeeklyBookings] = useState({})

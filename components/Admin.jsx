@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from 'react'
-import { supabase } from '../../lib/supabase' // Goes up two levels to lib/
+import { supabase } from '@/lib/supabase';
 
 function AdminDashboard() {
   const [bookings, setBookings] = useState([])
