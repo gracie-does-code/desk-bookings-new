@@ -1,5 +1,5 @@
-import AdminAuth from '@/components/AdminAuth';
-import AdminDashboard from '@/components/Admin';
+import AdminAuth from '../components/AdminAuth.jsx';
+import Admin from '../components/Admin.jsx';
 
 export default function AdminPage() {
   return (
