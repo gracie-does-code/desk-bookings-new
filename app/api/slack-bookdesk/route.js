@@ -194,6 +194,246 @@ async function handleCancelBooking(userName, userId, targetDate) {
   }
 }
 
+async function showBookingModal(triggerId) {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowStr = tomorrow.toISOString().split('T')[0];
+
+  const modal = {
+    type: 'modal',
+    callback_id: 'desk_booking_modal',
+    title: {
+      type: 'plain_text',
+      text: '🏢 Book a Desk'
+    },
+    submit: {
+      type: 'plain_text',
+      text: 'Book Desk'
+    },
+    close: {
+      type: 'plain_text',
+      text: 'Cancel'
+    },
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'staff_name',
+        element: {
+          type: 'plain_text_input',
+          action_id: 'name_input',
+          placeholder: {
+            type: 'plain_text',
+            text: 'Enter your full name'
+          }
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Staff Name'
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'booking_date',
+        element: {
+          type: 'datepicker',
+          action_id: 'date_picker',
+          initial_date: tomorrowStr,
+          placeholder: {
+            type: 'plain_text',
+            text: 'Select a date'
+          }
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Date'
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'desk_area',
+        element: {
+          type: 'static_select',
+          action_id: 'area_select',
+          placeholder: {
+            type: 'plain_text',
+            text: 'Choose office location'
+          },
+          options: [
+            {
+              text: { type: 'plain_text', text: 'NCL - Monument' },
+              value: 'NCL - Monument'
+            },
+            {
+              text: { type: 'plain_text', text: 'NCL - St James' },
+              value: 'NCL - St James'
+            },
+            {
+              text: { type: 'plain_text', text: 'NCL - Kitchen' },
+              value: 'NCL - Kitchen'
+            },
+            {
+              text: { type: 'plain_text', text: 'Dallas - Desk' },
+              value: 'Dallas - Desk'
+            }
+          ]
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Office Location'
+        }
+      },
+      {
+        type: 'input',
+        block_id: 'parking_space',
+        element: {
+          type: 'checkboxes',
+          action_id: 'parking_checkbox',
+          options: [
+            {
+              text: {
+                type: 'plain_text',
+                text: 'I need a parking space'
+              },
+              value: 'need_parking'
+            }
+          ]
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Parking (NCL locations only)'
+        },
+        optional: true
+      }
+    ]
+  };
+
+  try {
+    const response = await fetch('https://slack.com/api/views.open', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        trigger_id: triggerId,
+        view: modal
+      })
+    });
+
+    const result = await response.json();
+    console.log('Modal open result:', result);
+    return result;
+  } catch (error) {
+    console.error('Error opening modal:', error);
+    throw error;
+  }
+}
+
+async function handleModalSubmission(payload) {
+  const values = payload.view.state.values;
+  const staffName = values.staff_name.name_input.value;
+  const bookingDate = values.booking_date.date_picker.selected_date;
+  const deskArea = values.desk_area.area_select.selected_option.value;
+  const needsParking = values.parking_space?.parking_checkbox?.selected_options?.length > 0;
+
+  try {
+    // Check for duplicate booking
+    const { hasDuplicate, existingBooking, error: duplicateError } = await checkDuplicateBooking(staffName, bookingDate);
+    
+    if (duplicateError) {
+      return {
+        response_action: 'errors',
+        errors: {
+          staff_name: `Error checking existing bookings: ${duplicateError}`
+        }
+      };
+    }
+
+    if (hasDuplicate) {
+      return {
+        response_action: 'errors',
+        errors: {
+          staff_name: `${staffName} already has a booking on ${new Date(bookingDate).toLocaleDateString('en-GB')} at ${existingBooking.desk_area}`
+        }
+      };
+    }
+
+    // Check desk availability
+    const areaKey = deskArea.toLowerCase().replace(/\s+/g, '_').replace('-', '');
+    const { deskCount } = await getCurrentBookings(bookingDate, areaKey);
+    const deskLimit = DESK_LIMITS[areaKey] || 0;
+
+    if (deskCount >= deskLimit) {
+      return {
+        response_action: 'errors',
+        errors: {
+          desk_area: `${deskArea} is fully booked (${deskCount}/${deskLimit})`
+        }
+      };
+    }
+
+    // Check parking availability for NCL locations
+    let parkingError = null;
+    if (needsParking && deskArea.includes('NCL')) {
+      const totalParking = await getTotalNCLParking(bookingDate);
+      if (totalParking >= TOTAL_NCL_PARKING) {
+        parkingError = `Parking is full (${totalParking}/${TOTAL_NCL_PARKING})`;
+      }
+    }
+
+    if (parkingError) {
+      return {
+        response_action: 'errors',
+        errors: {
+          parking_space: parkingError
+        }
+      };
+    }
+
+    // Create the booking
+    const { data, error } = await supabase
+      .from('bookings')
+      .insert([{
+        employee_name: staffName,
+        date: bookingDate,
+        desk_area: deskArea,
+        parking_space: needsParking && deskArea.includes('NCL'),
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      return {
+        response_action: 'errors',
+        errors: {
+          staff_name: `Database error: ${error.message}`
+        }
+      };
+    }
+
+    // Return success response
+    const successText = `✅ *Desk Booked Successfully!*\n\n` +
+      `👤 *Staff:* ${staffName}\n` +
+      `📅 *Date:* ${new Date(bookingDate).toLocaleDateString('en-GB')}\n` +
+      `🪑 *Location:* ${deskArea}` +
+      `${data.parking_space ? '\n🚗 *Parking:* Reserved' : ''}`;
+
+    return {
+      response_action: 'clear'
+    };
+
+  } catch (error) {
+    console.error('Error processing booking:', error);
+    return {
+      response_action: 'errors',
+      errors: {
+        staff_name: `Error: ${error.message}`
+      }
+    };
+  }
+}
+
 export async function GET() {
   return NextResponse.json({ error: 'Method not allowed' }, { status: 405 });
 }
@@ -220,6 +460,13 @@ export async function POST(request) {
     console.log('Parsed body:', body);
     console.log('Command:', body?.command);
 
+    // ---- MODAL INTERACTION ----
+    if (body.type === 'view_submission') {
+      console.log('Processing modal submission');
+      const result = await handleModalSubmission(body);
+      return NextResponse.json(result);
+    }
+
     // ---- SLASH COMMAND ----
     if (body.command === '/bookdesk') {
       console.log('Processing /bookdesk command');
@@ -241,11 +488,9 @@ export async function POST(request) {
         return NextResponse.json(cancelResponse);
       }
 
-      // For now, return a simple test response until we implement the full modal
-      return NextResponse.json({
-        text: '🏢 Desk booking API is working! Full modal functionality coming next...',
-        response_type: 'ephemeral'
-      });
+      // Default: Show booking modal
+      await showBookingModal(body.trigger_id);
+      return NextResponse.json({ text: 'Opening desk booking form...' });
     }
 
     return NextResponse.json({
@@ -261,3 +506,4 @@ export async function POST(request) {
     }, { status: 500 });
   }
 }
+EOF
